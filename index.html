@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DigiSapiens Voice Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2rem;
+      background: #0f0f11;
+      color: #e8e8e8;
+      font-family: 'Courier New', monospace;
+    }
+    h1 { font-size: 1.4rem; letter-spacing: 0.3em; text-transform: uppercase; color: #888; }
+    #record {
+      width: 120px; height: 120px; border-radius: 50%;
+      border: 2px solid #444; background: #1a1a1e;
+      color: #e8e8e8; font-family: inherit; font-size: 0.7rem;
+      letter-spacing: 0.15em; text-transform: uppercase;
+      cursor: pointer; transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+      user-select: none;
+    }
+    #record:hover { border-color: #666; }
+    #record.recording {
+      border-color: #e05555; background: #2a1a1a;
+      box-shadow: 0 0 24px rgba(220, 60, 60, 0.3);
+    }
+    #status { font-size: 0.72rem; letter-spacing: 0.2em; color: #555; text-transform: uppercase; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <h1>DigiSapiens</h1>
+  <button id="record">Hold to<br>Talk</button>
+  <div id="status">Connecting…</div>
+
+<script>
+  const btn = document.getElementById("record");
+  const status = document.getElementById("status");
+
+  // Gemini expects 16 kHz input and outputs 24 kHz audio
+  const RECORD_SAMPLE_RATE = 16000;
+  const PLAYBACK_SAMPLE_RATE = 24000;
+
+  // Separate contexts: recording at 16 kHz forces the browser to resample on capture,
+  // playback at 24 kHz matches Gemini's output rate exactly.
+  const recordCtx   = new AudioContext({ sampleRate: RECORD_SAMPLE_RATE });
+  const playbackCtx = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
+
+  const playbackQueue = [];
+  let isPlaying = false;
+  let ws, mediaRecorder, chunks = [];
+
+  // --- WebSocket ---
+  function connect() {
+    ws = new WebSocket("ws://127.0.0.1:8000/ws");
+    ws.binaryType = "arraybuffer";
+    ws.onopen  = () => setStatus("ready");
+    ws.onclose = () => { setStatus("disconnected"); setTimeout(connect, 2000); }; // auto-reconnect
+    ws.onerror = () => setStatus("error");
+    ws.onmessage = ({ data }) => {
+      if (data.byteLength >= 100) {          // accept smaller chunks too
+        playbackQueue.push(data);
+        if (!isPlaying) drainQueue();
+      }
+    };
+  }
+
+  // --- Recording ---
+  async function initMic() {
+    // Request mono 16 kHz from the browser up front
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, sampleRate: RECORD_SAMPLE_RATE }
+    });
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+      const blob = new Blob(chunks, { type: "audio/webm" });
+      chunks = [];
+      // Decode via the 16 kHz context → browser resamples for us
+      const arrayBuffer = await blob.arrayBuffer();
+      const decoded = await recordCtx.decodeAudioData(arrayBuffer);
+      ws.send(toPCM16(decoded));
+      setStatus("waiting…");
+    };
+  }
+
+  // Float32 → Int16 PCM (mono, already at 16 kHz from recordCtx)
+  function toPCM16(audioBuffer) {
+    const samples = audioBuffer.getChannelData(0);
+    const out = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out.buffer;
+  }
+
+  // --- Playback ---
+  async function drainQueue() {
+    isPlaying = true;
+    while (playbackQueue.length > 0) {
+      const buf = playbackQueue.shift();
+      const int16   = new Int16Array(buf);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+      const audioBuf = playbackCtx.createBuffer(1, float32.length, PLAYBACK_SAMPLE_RATE);
+      audioBuf.copyToChannel(float32, 0);
+
+      const src = playbackCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(playbackCtx.destination);
+      await new Promise(r => { src.onended = r; src.start(); });
+    }
+    isPlaying = false;
+    setStatus("ready");
+  }
+
+  // --- Button ---
+  btn.onmousedown = () => {
+    chunks = [];
+    mediaRecorder.start();
+    btn.classList.add("recording");
+    setStatus("recording…");
+  };
+  btn.onmouseup = () => {
+    mediaRecorder.stop();
+    btn.classList.remove("recording");
+  };
+  btn.ontouchstart = (e) => { e.preventDefault(); btn.onmousedown(); };
+  btn.ontouchend   = (e) => { e.preventDefault(); btn.onmouseup(); };
+
+  function setStatus(msg) { status.textContent = msg; }
+
+  connect();
+  initMic();
+</script>
+</body>
+</html>
