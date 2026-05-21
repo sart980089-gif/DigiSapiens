@@ -11,13 +11,8 @@ from google.genai import types
 load_dotenv()
 
 # --- Config ---
-# gemini-2.0-flash-live-001 and gemini-live-2.5-flash-native-audio are deprecated.
-# Use one of these two current Live API models:
-#   "gemini-2.5-flash-native-audio-preview-12-2025"  — native audio output
-#   "gemini-3.1-flash-live-preview"                   — latest, lower latency
 MODEL = "gemini-3.1-flash-live-preview"
-
-GEMINI_TIMEOUT = 20  # seconds to wait for Gemini before giving up
+GEMINI_TIMEOUT = 20  # seconds before we give up on a silent Gemini session
 
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
@@ -41,36 +36,58 @@ app.add_middleware(
 )
 
 
-async def query_gemini(audio_bytes: bytes) -> list[bytes]:
-    """Send one audio turn to Gemini and collect all audio response chunks."""
-    chunks = []
+async def stream_gemini_to_ws(audio_bytes: bytes, ws: WebSocket):
+    """
+    Open a Gemini Live session, send the user's audio, and forward each
+    audio chunk to the browser the moment it arrives — no buffering.
 
+    Gemini streams PCM chunks as fast as it generates them (faster than
+    real-time). We forward immediately so the browser can start playing
+    before generation is even done.
+
+    We stop on:
+      - generationComplete  → model finished generating (earliest signal)
+      - turn_complete       → fallback if generationComplete never fires
+      - interrupted         → user barged in
+    """
     async with client.aio.live.connect(model=MODEL, config=LIVE_CONFIG) as session:
-        # audio/pcm;rate=16000 must match what the browser actually sends (16 kHz PCM)
+
+        # Send the full user utterance and mark end of input
         await session.send_realtime_input(
             audio=types.Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
         )
         await session.send_realtime_input(audio_stream_end=True)
 
+        chunk_count = 0
+
         async for response in session.receive():
             content = response.server_content
-            if not content or content.interrupted:
+            if not content:
                 continue
 
-            # turn_complete signals end of this response
-            if getattr(content, "turn_complete", False):
+            # Interrupted — stop immediately; browser will flush its queue
+            if content.interrupted:
+                print("Gemini interrupted")
                 break
 
-            model_turn = content.model_turn
-            if not model_turn:
-                continue
+            # Stream each audio part straight to the browser
+            if content.model_turn:
+                for part in content.model_turn.parts:
+                    data = getattr(part, "inline_data", None)
+                    if data and data.mime_type.startswith("audio/pcm"):
+                        await ws.send_bytes(data.data)
+                        chunk_count += 1
 
-            for part in model_turn.parts:
-                data = getattr(part, "inline_data", None)
-                if data and data.mime_type.startswith("audio/pcm"):
-                    chunks.append(data.data)
+            # generationComplete fires as soon as the model stops generating,
+            # before the estimated playback delay that precedes turn_complete.
+            # Breaking here gives us the lowest latency for the next user turn.
+            if getattr(content, "generation_complete", False):
+                print(f"Generation complete — {chunk_count} chunk(s) streamed")
+                break
 
-    return chunks
+            if content.turn_complete:
+                print(f"Turn complete — {chunk_count} chunk(s) streamed")
+                break
 
 
 @app.websocket("/ws")
@@ -84,21 +101,14 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"Received audio: {len(audio_bytes)} bytes")
 
             try:
-                # Hard timeout so we never hang if Gemini stalls
-                chunks = await asyncio.wait_for(
-                    query_gemini(audio_bytes),
+                await asyncio.wait_for(
+                    stream_gemini_to_ws(audio_bytes, ws),
                     timeout=GEMINI_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 print(f"ERROR: Gemini did not respond within {GEMINI_TIMEOUT}s")
-                continue
             except Exception as e:
                 print(f"ERROR: Gemini session failed: {e}")
-                continue
-
-            print(f"Response complete — {len(chunks)} audio chunk(s)")
-            for chunk in chunks:
-                await ws.send_bytes(chunk)
 
     except WebSocketDisconnect:
         print("Client disconnected")

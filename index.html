@@ -30,66 +30,77 @@
       border-color: #e05555; background: #2a1a1a;
       box-shadow: 0 0 24px rgba(220, 60, 60, 0.3);
     }
-    #status { font-size: 0.72rem; letter-spacing: 0.2em; color: #555; text-transform: uppercase; min-height: 1.2em; }
+    #status {
+      font-size: 0.72rem; letter-spacing: 0.2em;
+      color: #555; text-transform: uppercase; min-height: 1.2em;
+    }
   </style>
 </head>
 <body>
-  <h1>DigiSapiens</h1>
+  <h1>Hello there User!</h1>
   <button id="record">Hold to<br>Talk</button>
   <div id="status">Connecting…</div>
 
 <script>
-  const btn = document.getElementById("record");
+  const btn    = document.getElementById("record");
   const status = document.getElementById("status");
 
-  // Gemini expects 16 kHz input and outputs 24 kHz audio
-  const RECORD_SAMPLE_RATE = 16000;
-  const PLAYBACK_SAMPLE_RATE = 24000;
+  // Gemini expects 16 kHz PCM input and outputs 24 kHz PCM
+  const RECORD_RATE   = 16000;
+  const PLAYBACK_RATE = 24000;
 
-  // Separate contexts: recording at 16 kHz forces the browser to resample on capture,
-  // playback at 24 kHz matches Gemini's output rate exactly.
-  const recordCtx   = new AudioContext({ sampleRate: RECORD_SAMPLE_RATE });
-  const playbackCtx = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
+  // Lookahead buffer: how far ahead we schedule audio relative to currentTime.
+  // Larger = more protection against jitter, but slightly more latency before
+  // the first sound. 150 ms is a good balance for LAN/localhost.
+  const SCHEDULE_AHEAD_MS = 150;
 
-  const playbackQueue = [];
-  let isPlaying = false;
+  const recordCtx   = new AudioContext({ sampleRate: RECORD_RATE });
+  const playbackCtx = new AudioContext({ sampleRate: PLAYBACK_RATE });
+
+  // nextPlayAt tracks the AudioContext timestamp where the next chunk should
+  // start. This is the key to gapless, jitter-free playback:
+  //   - If we're behind (slow network), we clamp to currentTime + lookahead
+  //   - If chunks arrive faster than real-time (Gemini bursts), they queue up
+  //     perfectly end-to-end with no gap between them
+  let nextPlayAt = 0;
+
   let ws, mediaRecorder, chunks = [];
 
-  // --- WebSocket ---
+  // ── WebSocket ────────────────────────────────────────────────────────────
   function connect() {
     ws = new WebSocket("ws://127.0.0.1:8000/ws");
     ws.binaryType = "arraybuffer";
+
     ws.onopen  = () => setStatus("ready");
-    ws.onclose = () => { setStatus("disconnected"); setTimeout(connect, 2000); }; // auto-reconnect
+    ws.onclose = () => { setStatus("disconnected"); setTimeout(connect, 2000); };
     ws.onerror = () => setStatus("error");
+
     ws.onmessage = ({ data }) => {
-      if (data.byteLength >= 100) {          // accept smaller chunks too
-        playbackQueue.push(data);
-        if (!isPlaying) drainQueue();
-      }
+      // Each message is one raw PCM chunk from Gemini.
+      // Schedule it immediately on the audio timeline — no queue, no waiting.
+      schedulePCMChunk(data);
     };
   }
 
-  // --- Recording ---
+  // ── Recording ────────────────────────────────────────────────────────────
   async function initMic() {
-    // Request mono 16 kHz from the browser up front
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, sampleRate: RECORD_SAMPLE_RATE }
+      audio: { channelCount: 1, sampleRate: RECORD_RATE }
     });
     mediaRecorder = new MediaRecorder(stream);
     mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+
     mediaRecorder.onstop = async () => {
+      // Decode through a 16 kHz context so the browser resamples for us
       const blob = new Blob(chunks, { type: "audio/webm" });
       chunks = [];
-      // Decode via the 16 kHz context → browser resamples for us
-      const arrayBuffer = await blob.arrayBuffer();
-      const decoded = await recordCtx.decodeAudioData(arrayBuffer);
+      const decoded = await recordCtx.decodeAudioData(await blob.arrayBuffer());
       ws.send(toPCM16(decoded));
       setStatus("waiting…");
     };
   }
 
-  // Float32 → Int16 PCM (mono, already at 16 kHz from recordCtx)
+  // Float32 AudioBuffer → Int16 PCM buffer (mono, already at RECORD_RATE)
   function toPCM16(audioBuffer) {
     const samples = audioBuffer.getChannelData(0);
     const out = new Int16Array(samples.length);
@@ -100,29 +111,55 @@
     return out.buffer;
   }
 
-  // --- Playback ---
-  async function drainQueue() {
-    isPlaying = true;
-    while (playbackQueue.length > 0) {
-      const buf = playbackQueue.shift();
-      const int16   = new Int16Array(buf);
-      const float32 = new Float32Array(int16.length);
-      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+  // ── Gapless playback scheduler ───────────────────────────────────────────
+  // Called once per incoming WebSocket message (one PCM chunk from Gemini).
+  //
+  // How it works:
+  //   Gemini sends chunks faster than real-time — a 0.5 s response might
+  //   arrive in 5 chunks over 80 ms. If we played each on arrival we'd hear
+  //   5 blobs with gaps between them whenever the CPU or network hiccups.
+  //
+  //   Instead we maintain nextPlayAt: an absolute AudioContext timestamp.
+  //   Each chunk is scheduled to start exactly when the previous one ends.
+  //   The lookahead clamp (SCHEDULE_AHEAD_MS) ensures we never schedule in
+  //   the past even if a chunk arrives late.
+  //
+  function schedulePCMChunk(arrayBuffer) {
+    // Unpack Int16 → Float32
+    const int16   = new Int16Array(arrayBuffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
-      const audioBuf = playbackCtx.createBuffer(1, float32.length, PLAYBACK_SAMPLE_RATE);
-      audioBuf.copyToChannel(float32, 0);
+    // Build an AudioBuffer at the playback sample rate
+    const audioBuf = playbackCtx.createBuffer(1, float32.length, PLAYBACK_RATE);
+    audioBuf.copyToChannel(float32, 0);
 
-      const src = playbackCtx.createBufferSource();
-      src.buffer = audioBuf;
-      src.connect(playbackCtx.destination);
-      await new Promise(r => { src.onended = r; src.start(); });
+    // Clamp: never schedule in the past, always at least SCHEDULE_AHEAD_MS
+    // ahead so the audio thread has time to prepare the buffer.
+    const minStart = playbackCtx.currentTime + SCHEDULE_AHEAD_MS / 1000;
+    const startAt  = Math.max(minStart, nextPlayAt);
+
+    const src = playbackCtx.createBufferSource();
+    src.buffer = audioBuf;
+    src.connect(playbackCtx.destination);
+    src.start(startAt);
+
+    // Advance the pointer by exactly this chunk's duration
+    nextPlayAt = startAt + audioBuf.duration;
+
+    // Update status once playback actually begins (only for the first chunk)
+    if (nextPlayAt - audioBuf.duration <= playbackCtx.currentTime + SCHEDULE_AHEAD_MS / 1000 + 0.01) {
+      src.onended = () => {
+        // If nothing else is queued, we're done
+        if (nextPlayAt <= playbackCtx.currentTime + 0.05) setStatus("ready");
+      };
     }
-    isPlaying = false;
-    setStatus("ready");
   }
 
-  // --- Button ---
+  // ── Button ───────────────────────────────────────────────────────────────
   btn.onmousedown = () => {
+    // Reset the play pointer so new response starts fresh (not appended to old)
+    nextPlayAt = 0;
     chunks = [];
     mediaRecorder.start();
     btn.classList.add("recording");
@@ -137,6 +174,7 @@
 
   function setStatus(msg) { status.textContent = msg; }
 
+  // Boot
   connect();
   initMic();
 </script>
