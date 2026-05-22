@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+<meta charset="UTF-8"/>
+
+<title>DigiSapiens</title>
+
+<style>
+
+*{
+    margin:0;
+    padding:0;
+    box-sizing:border-box;
+}
+
+body{
+
+    background:#0f0f11;
+    color:#e8e8e8;
+
+    font-family:monospace;
+
+    height:100vh;
+
+    display:flex;
+    flex-direction:column;
+
+    align-items:center;
+    justify-content:center;
+
+    gap:24px;
+}
+
+h1{
+
+    font-size:1.2rem;
+
+    letter-spacing:.2em;
+
+    color:#888;
+}
+
+#record{
+
+    width:140px;
+    height:140px;
+
+    border-radius:50%;
+
+    border:2px solid #444;
+
+    background:#1a1a1e;
+
+    color:white;
+
+    font-size:.8rem;
+
+    cursor:pointer;
+
+    transition:.2s;
+}
+
+#record.recording{
+
+    border-color:#ff5555;
+
+    box-shadow:
+        0 0 30px
+        rgba(255,80,80,.35);
+
+    background:#2a1a1a;
+}
+
+#status{
+
+    color:#666;
+    min-height:1.2rem;
+}
+
+#latency{
+
+    color:#777;
+    font-size:.85rem;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>Hello there user</h1>
+
+<button id="record">
+    Hold To Talk
+</button>
+
+<div id="status">
+    ready
+</div>
+
+<div id="latency"></div>
+
+<script>
+
+const SERVER =
+    "http://127.0.0.1:9000"
+
+const btn =
+    document.getElementById("record")
+
+const statusEl =
+    document.getElementById("status")
+
+const latencyEl =
+    document.getElementById("latency")
+
+let mediaRecorder
+
+let chunks = []
+
+let playbackCtx =
+    new AudioContext()
+
+let nextPlayAt = 0
+
+function setStatus(t){
+
+    statusEl.innerText = t
+}
+
+function resetPlayback(){
+
+    nextPlayAt = 0
+}
+
+async function initMic(){
+
+    const stream =
+
+        await navigator
+        .mediaDevices
+        .getUserMedia({
+
+            audio:{
+
+                channelCount:1,
+
+                echoCancellation:true,
+
+                noiseSuppression:true,
+
+                autoGainControl:true
+            }
+        })
+
+    mediaRecorder =
+        new MediaRecorder(
+
+            stream,
+
+            {
+                mimeType:
+                    "audio/webm;codecs=opus"
+            }
+        )
+
+    mediaRecorder.ondataavailable =
+        e => chunks.push(e.data)
+
+    mediaRecorder.onstop =
+        processRecording
+}
+
+async function processRecording(){
+
+    try{
+
+        setStatus("thinking...")
+
+        latencyEl.innerHTML = ""
+
+        resetPlayback()
+
+        const blob =
+
+            new Blob(
+
+                chunks,
+
+                {
+                    type:
+                    "audio/webm;codecs=opus"
+                }
+            )
+
+        chunks = []
+
+        const formData =
+            new FormData()
+
+        formData.append(
+
+            "file",
+
+            blob,
+
+            "audio.webm"
+        )
+
+        const responsePromise =
+
+            fetch(
+
+                `${SERVER}/voice`,
+
+                {
+                    method:"POST",
+                    body:formData
+                }
+            )
+
+        const uploadFinishedAt =
+            performance.now()
+
+        const response =
+            await responsePromise
+
+        if(!response.ok){
+
+            setStatus("pipeline error")
+            return
+        }
+
+        const llmLatency =
+
+            response.headers.get(
+                "X-LLM-Latency"
+            ) || "?"
+
+        const reader =
+            response.body.getReader()
+
+        let buffer =
+            new Uint8Array()
+
+        let firstAudio = true
+
+        setStatus("speaking...")
+
+        while(true){
+
+            const {done,value} =
+                await reader.read()
+
+            if(done)
+                break
+
+            if(!value)
+                continue
+
+            if(firstAudio){
+
+                firstAudio = false
+
+                const latency =
+
+                    performance.now()
+                    - uploadFinishedAt
+
+                latencyEl.innerHTML = `
+
+                    upload → first audio:
+                    ${Math.round(latency)} ms
+
+                    <br>
+
+                    llm:
+                    ${llmLatency} ms
+                `
+            }
+
+            const merged =
+
+                new Uint8Array(
+
+                    buffer.length
+                    + value.length
+                )
+
+            merged.set(buffer)
+
+            merged.set(
+                value,
+                buffer.length
+            )
+
+            buffer = merged
+
+            while(true){
+
+                if(buffer.length < 12)
+                    break
+
+                let riffIndex = -1
+
+                for(
+
+                    let i=0;
+                    i<buffer.length-4;
+                    i++
+
+                ){
+
+                    if(
+
+                        buffer[i]===82 &&
+                        buffer[i+1]===73 &&
+                        buffer[i+2]===70 &&
+                        buffer[i+3]===70
+
+                    ){
+
+                        riffIndex = i
+                        break
+                    }
+                }
+
+                if(riffIndex === -1){
+
+                    buffer =
+                        new Uint8Array()
+
+                    break
+                }
+
+                if(riffIndex > 0){
+
+                    buffer =
+                        buffer.slice(riffIndex)
+                }
+
+                if(buffer.length < 8)
+                    break
+
+                const wavSize =
+
+                    buffer[4]
+                    |
+                    (buffer[5]<<8)
+                    |
+                    (buffer[6]<<16)
+                    |
+                    (buffer[7]<<24)
+
+                const totalSize =
+                    wavSize + 8
+
+                if(
+                    buffer.length
+                    < totalSize
+                ) break
+
+                const wavFragment =
+
+                    buffer.slice(
+                        0,
+                        totalSize
+                    )
+
+                buffer =
+                    buffer.slice(totalSize)
+
+                await playWavFragment(
+                    wavFragment
+                )
+            }
+        }
+
+        setStatus("ready")
+
+    }catch(err){
+
+        console.error(err)
+
+        setStatus("error")
+    }
+}
+
+async function playWavFragment(
+    wavBytes
+){
+
+    const arrayBuffer =
+
+        wavBytes.buffer.slice(
+
+            wavBytes.byteOffset,
+
+            wavBytes.byteOffset
+            + wavBytes.byteLength
+        )
+
+    const audioBuffer =
+
+        await playbackCtx
+        .decodeAudioData(
+            arrayBuffer
+        )
+
+    const src =
+        playbackCtx
+        .createBufferSource()
+
+    src.buffer =
+        audioBuffer
+
+    src.connect(
+        playbackCtx.destination
+    )
+
+    const minStart =
+
+        playbackCtx.currentTime
+        + 0.05
+
+    const startAt =
+
+        Math.max(
+            minStart,
+            nextPlayAt
+        )
+
+    src.start(startAt)
+
+    nextPlayAt =
+        startAt
+        + audioBuffer.duration
+}
+
+btn.onmousedown = ()=>{
+
+    chunks = []
+
+    btn.classList.add(
+        "recording"
+    )
+
+    mediaRecorder.start()
+
+    setStatus("recording...")
+}
+
+btn.onmouseup = ()=>{
+
+    btn.classList.remove(
+        "recording"
+    )
+
+    mediaRecorder.stop()
+}
+
+btn.ontouchstart = e=>{
+
+    e.preventDefault()
+
+    btn.onmousedown()
+}
+
+btn.ontouchend = e=>{
+
+    e.preventDefault()
+
+    btn.onmouseup()
+}
+
+initMic()
+
+</script>
+
+</body>
+</html>
