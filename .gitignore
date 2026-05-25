@@ -5,14 +5,6 @@ langgraph.json
 #not-yet folders
 hiring_analysis/
 
-#temp data
-images/
-
-#images
-*.png 
-*.jpg 
-*.jpeg 
-
 #logs
 logs/
 
