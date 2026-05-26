@@ -1,182 +1,597 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <title>DigiSapiens Voice Demo</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 2rem;
-      background: #0f0f11;
-      color: #e8e8e8;
-      font-family: 'Courier New', monospace;
-    }
-    h1 { font-size: 1.4rem; letter-spacing: 0.3em; text-transform: uppercase; color: #888; }
-    #record {
-      width: 120px; height: 120px; border-radius: 50%;
-      border: 2px solid #444; background: #1a1a1e;
-      color: #e8e8e8; font-family: inherit; font-size: 0.7rem;
-      letter-spacing: 0.15em; text-transform: uppercase;
-      cursor: pointer; transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
-      user-select: none;
-    }
-    #record:hover { border-color: #666; }
-    #record.recording {
-      border-color: #e05555; background: #2a1a1a;
-      box-shadow: 0 0 24px rgba(220, 60, 60, 0.3);
-    }
-    #status {
-      font-size: 0.72rem; letter-spacing: 0.2em;
-      color: #555; text-transform: uppercase; min-height: 1.2em;
-    }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DigiSapiens-vad</title>
+
+<script src="./assets/bundle.min.js"></script>
+
+<link rel="icon" href="./assets/favicon.ico">
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+
+body{
+background:#080b10;
+height:100vh;
+display:flex;
+justify-content:center;
+align-items:center;
+font-family:system-ui;
+overflow:hidden;
+color:#fff
+}
+
+.wrap{
+display:flex;
+flex-direction:column;
+align-items:center;
+gap:24px
+}
+
+.avatar{
+width:280px;
+height:280px;
+border-radius:50%;
+overflow:hidden;
+position:relative;
+background:#111827;
+border:2px solid #1f2937
+}
+
+.avatar img{
+position:absolute;
+inset:0;
+width:100%;
+height:100%;
+object-fit:cover
+}
+
+.ring{
+position:absolute;
+inset:-4px;
+border-radius:50%;
+border:3px solid transparent
+}
+
+.listen{
+border-color:#38bdf8;
+box-shadow:0 0 24px rgba(56,189,248,.5);
+animation:spin 3s linear infinite
+}
+
+.speak{
+border-color:#8b5cf6;
+box-shadow:0 0 24px rgba(139,92,246,.5);
+animation:spin 1s linear infinite
+}
+
+@keyframes spin{
+from{transform:rotate(0)}
+to{transform:rotate(360deg)}
+}
+
+button{
+width:84px;
+height:84px;
+border:none;
+border-radius:50%;
+background:#111827;
+color:#fff;
+font-size:30px;
+cursor:pointer
+}
+
+button.active{
+background:#0ea5e9
+}
+
+.status{
+opacity:.8
+}
+</style>
 </head>
+
 <body>
-  <h1>Hello there User!</h1>
-  <button id="record">Hold to<br>Talk</button>
-  <div id="status">Connecting…</div>
+
+<div class="wrap">
+
+<div class="avatar">
+
+<div class="ring" id="ring"></div>
+
+<img src="./assets/base.png">
+
+<img
+id="face"
+src="./assets/face_idle.png"
+>
+
+</div>
+
+<button id="btn">
+🎤
+</button>
+
+<div class="status" id="status">
+idle
+</div>
+
+</div>
 
 <script>
-  const btn    = document.getElementById("record");
-  const status = document.getElementById("status");
 
-  // Gemini expects 16 kHz PCM input and outputs 24 kHz PCM
-  const RECORD_RATE   = 16000;
-  const PLAYBACK_RATE = 24000;
+const WS="ws://127.0.0.1:9000/ws"
 
-  // Lookahead buffer: how far ahead we schedule audio relative to currentTime.
-  // Larger = more protection against jitter, but slightly more latency before
-  // the first sound. 150 ms is a good balance for LAN/localhost.
-  const SCHEDULE_AHEAD_MS = 150;
+const btn=document.getElementById("btn")
+const ring=document.getElementById("ring")
+const face=document.getElementById("face")
+const statusEl=document.getElementById("status")
 
-  const recordCtx   = new AudioContext({ sampleRate: RECORD_RATE });
-  const playbackCtx = new AudioContext({ sampleRate: PLAYBACK_RATE });
+const FACES={
+idle:"./assets/face_idle.png",
+small:"./assets/face_talk_small.png",
+medium:"./assets/face_talk_medium.png",
+large:"./assets/face_talk_large.png"
+}
 
-  // nextPlayAt tracks the AudioContext timestamp where the next chunk should
-  // start. This is the key to gapless, jitter-free playback:
-  //   - If we're behind (slow network), we clamp to currentTime + lookahead
-  //   - If chunks arrive faster than real-time (Gemini bursts), they queue up
-  //     perfectly end-to-end with no gap between them
-  let nextPlayAt = 0;
+let ws
+let running=false
+let myvad
 
-  let ws, mediaRecorder, chunks = [];
+let aiSpeaking=false
+let ignoreSpeech=false
 
-  // ── WebSocket ────────────────────────────────────────────────────────────
-  function connect() {
-    ws = new WebSocket("ws://127.0.0.1:8000/ws");
-    ws.binaryType = "arraybuffer";
+let playCtx=new AudioContext({
+sampleRate:24000
+})
 
-    ws.onopen  = () => setStatus("ready");
-    ws.onclose = () => { setStatus("disconnected"); setTimeout(connect, 2000); };
-    ws.onerror = () => setStatus("error");
+let analyser=playCtx.createAnalyser()
 
-    ws.onmessage = ({ data }) => {
-      // Each message is one raw PCM chunk from Gemini.
-      // Schedule it immediately on the audio timeline — no queue, no waiting.
-      schedulePCMChunk(data);
-    };
-  }
+analyser.fftSize=256
 
-  // ── Recording ────────────────────────────────────────────────────────────
-  async function initMic() {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, sampleRate: RECORD_RATE }
-    });
-    mediaRecorder = new MediaRecorder(stream);
-    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+analyser.connect(
+playCtx.destination
+)
 
-    mediaRecorder.onstop = async () => {
-      // Decode through a 16 kHz context so the browser resamples for us
-      const blob = new Blob(chunks, { type: "audio/webm" });
-      chunks = [];
-      const decoded = await recordCtx.decodeAudioData(await blob.arrayBuffer());
-      ws.send(toPCM16(decoded));
-      setStatus("waiting…");
-    };
-  }
+let td=new Uint8Array(
+analyser.fftSize
+)
 
-  // Float32 AudioBuffer → Int16 PCM buffer (mono, already at RECORD_RATE)
-  function toPCM16(audioBuffer) {
-    const samples = audioBuffer.getChannelData(0);
-    const out = new Int16Array(samples.length);
-    for (let i = 0; i < samples.length; i++) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    return out.buffer;
-  }
+let nextPlay=0
 
-  // ── Gapless playback scheduler ───────────────────────────────────────────
-  // Called once per incoming WebSocket message (one PCM chunk from Gemini).
-  //
-  // How it works:
-  //   Gemini sends chunks faster than real-time — a 0.5 s response might
-  //   arrive in 5 chunks over 80 ms. If we played each on arrival we'd hear
-  //   5 blobs with gaps between them whenever the CPU or network hiccups.
-  //
-  //   Instead we maintain nextPlayAt: an absolute AudioContext timestamp.
-  //   Each chunk is scheduled to start exactly when the previous one ends.
-  //   The lookahead clamp (SCHEDULE_AHEAD_MS) ensures we never schedule in
-  //   the past even if a chunk arrives late.
-  //
-  function schedulePCMChunk(arrayBuffer) {
-    // Unpack Int16 → Float32
-    const int16   = new Int16Array(arrayBuffer);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+let active=[]
 
-    // Build an AudioBuffer at the playback sample rate
-    const audioBuf = playbackCtx.createBuffer(1, float32.length, PLAYBACK_RATE);
-    audioBuf.copyToChannel(float32, 0);
+function status(t){
 
-    // Clamp: never schedule in the past, always at least SCHEDULE_AHEAD_MS
-    // ahead so the audio thread has time to prepare the buffer.
-    const minStart = playbackCtx.currentTime + SCHEDULE_AHEAD_MS / 1000;
-    const startAt  = Math.max(minStart, nextPlayAt);
+statusEl.textContent=t
+}
 
-    const src = playbackCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.connect(playbackCtx.destination);
-    src.start(startAt);
+function connect(){
 
-    // Advance the pointer by exactly this chunk's duration
-    nextPlayAt = startAt + audioBuf.duration;
+ws=new WebSocket(WS)
 
-    // Update status once playback actually begins (only for the first chunk)
-    if (nextPlayAt - audioBuf.duration <= playbackCtx.currentTime + SCHEDULE_AHEAD_MS / 1000 + 0.01) {
-      src.onended = () => {
-        // If nothing else is queued, we're done
-        if (nextPlayAt <= playbackCtx.currentTime + 0.05) setStatus("ready");
-      };
-    }
-  }
+ws.binaryType="arraybuffer"
 
-  // ── Button ───────────────────────────────────────────────────────────────
-  btn.onmousedown = () => {
-    // Reset the play pointer so new response starts fresh (not appended to old)
-    nextPlayAt = 0;
-    chunks = [];
-    mediaRecorder.start();
-    btn.classList.add("recording");
-    setStatus("recording…");
-  };
-  btn.onmouseup = () => {
-    mediaRecorder.stop();
-    btn.classList.remove("recording");
-  };
-  btn.ontouchstart = (e) => { e.preventDefault(); btn.onmousedown(); };
-  btn.ontouchend   = (e) => { e.preventDefault(); btn.onmouseup(); };
+ws.onopen=()=>{
 
-  function setStatus(msg) { status.textContent = msg; }
+console.log("[ws] connected")
 
-  // Boot
-  connect();
-  initMic();
+status("connected")
+}
+
+ws.onmessage=({data})=>{
+
+if(data instanceof ArrayBuffer){
+
+aiSpeaking=true
+
+ignoreSpeech=true
+
+play(data)
+
+ring.classList.remove(
+"listen"
+)
+
+ring.classList.add(
+"speak"
+)
+
+status("speaking")
+
+return
+}
+
+if(data==="__thinking__"){
+
+status("thinking")
+
+ring.classList.remove(
+"speak"
+)
+
+return
+}
+
+if(data==="__done__"){
+
+aiSpeaking=false
+
+ignoreSpeech=false
+
+status("idle")
+
+ring.classList.remove(
+"speak"
+)
+
+return
+}
+
+if(data==="__interrupted__"){
+
+aiSpeaking=false
+
+ignoreSpeech=false
+
+status("idle")
+}
+}
+
+ws.onclose=()=>{
+
+console.log("[ws] reconnecting")
+
+status("reconnecting")
+
+setTimeout(
+connect,
+2000
+)
+}
+
+ws.onerror=e=>{
+
+console.error("[ws]",e)
+}
+}
+
+function stopAudio(){
+
+for(const s of active){
+
+try{s.stop()}catch{}
+}
+
+active=[]
+
+nextPlay=0
+
+aiSpeaking=false
+
+ignoreSpeech=false
+}
+
+function play(buf){
+
+const pcm=new Int16Array(buf)
+
+const f32=new Float32Array(
+pcm.length
+)
+
+for(let i=0;i<pcm.length;i++)
+f32[i]=pcm[i]/32768
+
+const audioBuf=playCtx.createBuffer(
+1,
+f32.length,
+24000
+)
+
+audioBuf.copyToChannel(
+f32,
+0
+)
+
+const src=playCtx.createBufferSource()
+
+src.buffer=audioBuf
+
+src.connect(analyser)
+
+const start=Math.max(
+playCtx.currentTime+.02,
+nextPlay
+)
+
+src.start(start)
+
+nextPlay=start+audioBuf.duration
+
+active.push(src)
+
+src.onended=()=>{
+
+active=active.filter(
+x=>x!==src
+)
+
+if(active.length===0){
+
+aiSpeaking=false
+
+ignoreSpeech=false
+}
+}
+}
+
+function f32ToPCM(float32){
+
+const pcm=new Int16Array(
+float32.length
+)
+
+for(let i=0;i<float32.length;i++){
+
+let s=Math.max(
+-1,
+Math.min(1,float32[i])
+)
+
+pcm[i]=s<0
+?s*0x8000
+:s*0x7fff
+}
+
+return pcm.buffer
+}
+
+async function start(){
+
+if(running)
+return
+
+running=true
+
+if(
+!ws||
+ws.readyState!==1
+){
+connect()
+}
+
+await playCtx.resume()
+
+console.log("[vad] loading...")
+
+myvad=await vad.MicVAD.new({
+
+onnxWASMBasePath:
+"https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+
+baseAssetPath:
+"https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+
+positiveSpeechThreshold:.92,
+
+negativeSpeechThreshold:.78,
+
+minSpeechFrames:8,
+
+preSpeechPadFrames:6,
+
+redemptionFrames:16,
+
+getStream:async()=>{
+
+return navigator.mediaDevices.getUserMedia({
+
+audio:{
+
+channelCount:1,
+
+echoCancellation:true,
+
+noiseSuppression:true,
+
+autoGainControl:true
+}
+})
+},
+
+onSpeechStart:()=>{
+
+if(ignoreSpeech){
+
+console.log(
+"[vad] ignored speech during ai response"
+)
+
+return
+}
+
+console.log("[vad] speech start")
+
+status("listening")
+
+ring.classList.remove(
+"speak"
+)
+
+ring.classList.add(
+"listen"
+)
+},
+
+onSpeechEnd:(audio)=>{
+
+if(ignoreSpeech){
+
+console.log(
+"[vad] ignored completed speech"
+)
+
+return
+}
+
+console.log(
+"[vad] speech end",
+audio.length
+)
+
+let sum=0
+
+for(let i=0;i<audio.length;i++)
+sum+=audio[i]*audio[i]
+
+const rms=Math.sqrt(
+sum/audio.length
+)
+
+console.log(
+"[vad] rms",
+rms
+)
+
+if(rms<0.02){
+
+console.log(
+"[vad] weak speech ignored"
+)
+
+status("idle")
+
+ring.classList.remove(
+"listen"
+)
+
+return
+}
+
+status("thinking")
+
+ring.classList.remove(
+"listen"
+)
+
+const pcm=f32ToPCM(audio)
+
+if(
+ws &&
+ws.readyState===1
+){
+
+ws.send(pcm)
+}
+},
+
+onVADMisfire:()=>{
+
+if(ignoreSpeech)
+return
+
+console.log("[vad] misfire")
+
+status("idle")
+
+ring.classList.remove(
+"listen"
+)
+}
+})
+
+await myvad.start()
+
+console.log("[vad] ready")
+
+btn.classList.add(
+"active"
+)
+
+status("idle")
+}
+
+async function stop(){
+
+running=false
+
+stopAudio()
+
+if(myvad){
+
+await myvad.pause()
+
+myvad.destroy()
+
+myvad=null
+}
+
+btn.classList.remove(
+"active"
+)
+
+ring.classList.remove(
+"listen",
+"speak"
+)
+
+status("stopped")
+}
+
+function mouth(){
+
+analyser.getByteTimeDomainData(
+td
+)
+
+let ss=0
+
+for(let i=0;i<td.length;i++){
+
+const v=(td[i]-128)/128
+
+ss+=v*v
+}
+
+const rms=Math.sqrt(
+ss/td.length
+)*40
+
+let f="idle"
+
+if(rms>2&&rms<6)
+f="small"
+
+else if(rms>=6&&rms<10)
+f="medium"
+
+else if(rms>=10)
+f="large"
+
+if(face.src!==FACES[f])
+face.src=FACES[f]
+
+requestAnimationFrame(
+mouth
+)
+}
+
+btn.onclick=()=>{
+
+if(running)
+stop()
+else
+start()
+}
+
+connect()
+
+mouth()
+
 </script>
+
 </body>
 </html>

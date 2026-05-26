@@ -1,41 +1,48 @@
+"""
+llm_tts.py — LLM + TTS voice pipeline with server-side VAD over WebSocket
+
+Flow:
+  Browser streams raw PCM16 @ 16 kHz chunks over WebSocket →
+  Server VAD detects speech segment                         →
+  Audio → Gemini (LLM, audio-in / text-out)                →
+  Text → TTS server                                         →
+  WAV fragments streamed back over WebSocket                →
+  Browser plays gaplessly
+
+Latency wins:
+  • No upload round-trip — LLM fires the instant VAD closes the gate
+  • TTS WAV fragments forwarded as they arrive (no re-buffering)
+  • Text-only conversation history (no audio blobs in context window)
+"""
+
+import asyncio
+import base64
+import json
 import os
 import re
-import json
-import time
-import base64
 import tempfile
+import time
+from collections import deque
+
 import requests
+import webrtcvad
+import wave
+import io
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketDisconnect
 
 from langchain_openrouter import ChatOpenRouter
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from langchain_core.messages import (
-    HumanMessage,
-    AIMessage,
-    SystemMessage
-)
+# ── Config ────────────────────────────────────────────────────────────────────
+TTS_SERVER = os.getenv("TTS_SERVER", "http://127.0.0.1:7000")
 
-app = FastAPI(title="voice-pipeline")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-TTS_SERVER = os.getenv("TTS_SERVER")
-
-llm = ChatOpenRouter(
-    model="google/gemini-2.5-flash"
-)
+llm = ChatOpenRouter(model="google/gemini-2.5-flash")
 
 SYSTEM_PROMPT = """
 You are Lisa, a friendly voice-first AI assistant.
@@ -44,7 +51,6 @@ CRITICAL IDENTITY RULES:
 - Your name is Lisa. You are NOT Gemini, NOT Google Assistant, NOT any other AI.
 - If asked who you are: say you are Lisa.
 - Never reveal the underlying model or technology stack.
-- Never say you are "a large language model trained by Google" or anything similar.
 
 You will receive a voice message from the user.
 
@@ -65,271 +71,288 @@ Strict rules for the response field:
 - Never start your reply with "I" as the very first word
 """
 
-# Text-only conversation history (no audio blobs)
-conversation_history = []
-
 MAX_HISTORY = 12
 
+# ── VAD config ────────────────────────────────────────────────────────────────
+SAMPLE_RATE     = 16_000
+FRAME_MS        = 30
+FRAME_BYTES     = int(SAMPLE_RATE * FRAME_MS / 1000) * 2
+VAD_MODE        = 3
+START_FRAMES    = 4
+END_FRAMES      = 30
+PRE_ROLL_FRAMES = 8
+MIN_SPEECH_SECS = 0.4
 
-# ---------------------------------------------------
-# JSON EXTRACTION — ROBUST
-# ---------------------------------------------------
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="voice-pipeline-ws")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── VAD ───────────────────────────────────────────────────────────────────────
+class VadProcessor:
+    def __init__(self):
+        self._vad         = webrtcvad.Vad(VAD_MODE)
+        self._raw_buf     = bytearray()
+        self._pre_roll    = deque(maxlen=PRE_ROLL_FRAMES)
+        self._speech_buf  = bytearray()
+        self._in_speech   = False
+        self._speech_cnt  = 0
+        self._silence_cnt = 0
+
+    def feed(self, chunk: bytes) -> bytes | None:
+        self._raw_buf.extend(chunk)
+        utterance = None
+        while len(self._raw_buf) >= FRAME_BYTES:
+            frame = bytes(self._raw_buf[:FRAME_BYTES])
+            del self._raw_buf[:FRAME_BYTES]
+            u = self._process_frame(frame)
+            if u is not None:
+                utterance = u
+        return utterance
+
+    def _process_frame(self, frame: bytes) -> bytes | None:
+        try:
+            is_speech = self._vad.is_speech(frame, SAMPLE_RATE)
+        except Exception:
+            is_speech = False
+
+        if is_speech:
+            self._speech_cnt  += 1
+            self._silence_cnt  = 0
+        else:
+            self._silence_cnt += 1
+            self._speech_cnt   = 0
+
+        if not self._in_speech:
+            self._pre_roll.append(frame)
+            if self._speech_cnt >= START_FRAMES:
+                self._in_speech = True
+                for f in self._pre_roll:
+                    self._speech_buf.extend(f)
+                self._pre_roll.clear()
+                print("[vad] START")
+        else:
+            self._speech_buf.extend(frame)
+            if self._silence_cnt >= END_FRAMES:
+                print("[vad] END")
+                utterance = bytes(self._speech_buf)
+                self._speech_buf.clear()
+                self._in_speech   = False
+                self._speech_cnt  = 0
+                self._silence_cnt = 0
+                duration = len(utterance) / 2 / SAMPLE_RATE
+                if duration < MIN_SPEECH_SECS:
+                    print(f"[vad] discard — too short ({duration:.2f}s)")
+                    return None
+                return utterance
+        return None
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def pcm_to_webm_file(pcm_bytes: bytes) -> str:
+    """Write raw PCM16 to a temp WAV file (LLM accepts audio/wav)."""
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    with wave.open(tf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm_bytes)
+    tf.close()
+    return tf.name
+
 
 def extract_json(raw: str) -> dict | None:
-    """
-    Try multiple strategies to extract a JSON object from raw model output.
-    Returns a dict on success, None on failure.
-    """
-
-    # Strategy 1: direct parse
     try:
         return json.loads(raw.strip())
     except Exception:
         pass
-
-    # Strategy 2: strip markdown fences then parse
     cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
     try:
         return json.loads(cleaned)
     except Exception:
         pass
-
-    # Strategy 3: regex — find first {...} block
-    match = re.search(r"\{.*?\}", raw, re.DOTALL)
-    if match:
+    m = re.search(r"\{.*?\}", raw, re.DOTALL)
+    if m:
         try:
-            return json.loads(match.group())
+            return json.loads(m.group())
         except Exception:
             pass
-
-    # Strategy 4: manually extract fields from key:value pattern
-    transcript_match = re.search(
-        r'"transcript"\s*:\s*"((?:[^"\\]|\\.)*)"', raw
-    )
-    response_match = re.search(
-        r'"response"\s*:\s*"((?:[^"\\]|\\.)*)"', raw
-    )
-    if response_match:
-        return {
-            "transcript": transcript_match.group(1) if transcript_match else "",
-            "response": response_match.group(1),
-        }
-
+    t = re.search(r'"transcript"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    r = re.search(r'"response"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    if r:
+        return {"transcript": t.group(1) if t else "", "response": r.group(1)}
     return None
 
 
-# ---------------------------------------------------
-# GEMINI AUDIO INPUT
-# ---------------------------------------------------
-
-def invoke_llm_audio(audio_path: str):
-
-    global conversation_history
-
-    audio_data = base64.b64encode(
-        open(audio_path, "rb").read()
-    ).decode("utf-8")
-
-    # Build the current user message with audio — NOT stored in history
-    current_audio_message = HumanMessage(
-        content=[
-            {
-                "type": "text",
-                "text": "Process this voice input and respond as Lisa.",
-            },
-            {
-                "type": "audio",
-                "base64": audio_data,
-                "mime_type": "audio/webm",
-            },
-        ]
-    )
-
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
-    messages.extend(conversation_history)   # text-only history
-    messages.append(current_audio_message)
-
-    response = llm.invoke(messages)
-    raw = str(response.content).strip()
-
-    print("\nRAW MODEL OUTPUT:")
-    print(raw)
-    print()
-
-    # ----------------------------------------
-    # PARSE
-    # ----------------------------------------
-
-    parsed = extract_json(raw)
-
-    if parsed:
-        transcript = str(parsed.get("transcript", "")).strip()
-        assistant_response = str(parsed.get("response", "")).strip()
-    else:
-        print("json parse failed — using fallback")
-        transcript = ""
-        assistant_response = ""
-
-    # ----------------------------------------
-    # SAFETY FALLBACKS
-    # ----------------------------------------
-
-    # Reject responses that leak model identity
-    identity_leaks = [
-        "large language model",
-        "trained by google",
-        "i am gemini",
-        "i'm gemini",
-        "google ai",
-    ]
-    if any(leak in assistant_response.lower() for leak in identity_leaks):
-        print("Identity leak detected — overriding response")
-        assistant_response = (
-            "My name is Aira, your AI assistant from DigiSapiens. "
-            "How can I help you today?"
-        )
-
-    if not assistant_response:
-        assistant_response = "Sorry, something went wrong. Could you try again?"
-
-    # ----------------------------------------
-    # STORE TEXT-ONLY HISTORY
-    # Append only if transcript is non-empty so
-    # blank HumanMessages never pollute history.
-    # ----------------------------------------
-
-    if transcript:
-        conversation_history.append(HumanMessage(content=transcript))
-
-    conversation_history.append(AIMessage(content=assistant_response))
-
-    # Keep history bounded
-    if len(conversation_history) > MAX_HISTORY:
-        conversation_history = conversation_history[-MAX_HISTORY:]
-
-    return transcript, assistant_response
-
-
-# ---------------------------------------------------
-# WAV FRAGMENT PARSER
-# ---------------------------------------------------
-
-def extract_wav_fragments(byte_buffer):
-
+def extract_wav_fragments(buf: bytearray) -> list[bytes]:
     fragments = []
-
     while True:
-
-        if len(byte_buffer) < 12:
+        if len(buf) < 12:
             break
-
-        riff_pos = byte_buffer.find(b"RIFF")
-
-        if riff_pos == -1:
-            byte_buffer.clear()
+        pos = buf.find(b"RIFF")
+        if pos == -1:
+            buf.clear()
             break
-
-        if riff_pos > 0:
-            del byte_buffer[:riff_pos]
-
-        if len(byte_buffer) < 8:
+        if pos > 0:
+            del buf[:pos]
+        if len(buf) < 8:
             break
-
-        wav_size = (
-            int.from_bytes(byte_buffer[4:8], "little") + 8
-        )
-
-        if len(byte_buffer) < wav_size:
+        size = int.from_bytes(buf[4:8], "little") + 8
+        if len(buf) < size:
             break
-
-        wav_fragment = bytes(byte_buffer[:wav_size])
-        del byte_buffer[:wav_size]
-        fragments.append(wav_fragment)
-
+        fragments.append(bytes(buf[:size]))
+        del buf[:size]
     return fragments
 
 
-# ---------------------------------------------------
-# PIPELINE
-# ---------------------------------------------------
+# ── LLM call ─────────────────────────────────────────────────────────────────
+IDENTITY_LEAKS = [
+    "large language model", "trained by google",
+    "i am gemini", "i'm gemini", "google ai",
+]
 
-@app.post("/voice")
-async def voice_pipeline(file: UploadFile = File(...)):
+def invoke_llm(wav_path: str, history: list) -> tuple[str, str]:
+    audio_b64 = base64.b64encode(open(wav_path, "rb").read()).decode()
 
-    pipeline_start = time.time()
+    user_msg = HumanMessage(content=[
+        {"type": "text", "text": "Process this voice input and respond as Lisa."},
+        {"type": "audio", "base64": audio_b64, "mime_type": "audio/wav"},
+    ])
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-        tmp.write(await file.read())
-        temp_path = tmp.name
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + history + [user_msg]
+    raw = str(llm.invoke(messages).content).strip()
+    print(f"[llm] raw: {raw[:120]}")
 
+    parsed = extract_json(raw)
+    if parsed:
+        transcript = str(parsed.get("transcript", "")).strip()
+        response   = str(parsed.get("response", "")).strip()
+    else:
+        transcript, response = "", ""
+
+    if any(leak in response.lower() for leak in IDENTITY_LEAKS):
+        response = "My name is Lisa, your AI assistant. How can I help you?"
+
+    if not response:
+        response = "Sorry, something went wrong. Could you try again?"
+
+    return transcript, response
+
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+async def run_pipeline(pcm: bytes, ws: WebSocket, history: list) -> tuple[str, str]:
+    """LLM → TTS → stream WAV fragments over WebSocket."""
+    t0 = time.time()
+
+    wav_path = pcm_to_webm_file(pcm)
     try:
+        loop = asyncio.get_event_loop()
+        transcript, text = await loop.run_in_executor(
+            None, invoke_llm, wav_path, list(history)
+        )
+        print(f"[llm] {time.time()-t0:.2f}s  user='{transcript}'  lisa='{text}'")
 
-        # -------------------------------------
-        # LLM AUDIO
-        # -------------------------------------
+        # Send metadata first so UI can show transcript
+        await ws.send_text(json.dumps({
+            "type": "meta",
+            "transcript": transcript,
+            "response": text,
+            "llm_ms": int((time.time() - t0) * 1000),
+        }))
 
-        llm_start = time.time()
-        transcript, assistant_text = invoke_llm_audio(temp_path)
-        llm_latency = int((time.time() - llm_start) * 1000)
-
-        print(f"user: {transcript}")
-        print(f"assistant: {assistant_text}")
-
-        # -------------------------------------
-        # TTS
-        # -------------------------------------
-
-        tts_response = requests.post(
-            f"{TTS_SERVER}/tts",
-            json={
-                "model": "lisa",
-                "reference_id": 6,
-                "text": assistant_text,
-            },
-            stream=True,
+        tts_resp = await loop.run_in_executor(
+            None,
+            lambda: requests.post(
+                f"{TTS_SERVER}/tts",
+                json={"model": "lisa", "reference_id": 6, "text": text},
+                stream=True,
+                timeout=30,
+            )
         )
 
-        if tts_response.status_code != 200:
-            return JSONResponse({"error": "tts failed"}, status_code=500)
+        if tts_resp.status_code != 200:
+            await ws.send_text(json.dumps({"type": "error", "msg": "tts failed"}))
+            return transcript, text
 
-        # -------------------------------------
-        # STREAM AUDIO
-        # -------------------------------------
+        byte_buf = bytearray()
+        first = True
 
-        def generate():
+        def iter_tts():
+            return tts_resp.iter_content(chunk_size=4096)
 
-            byte_buffer = bytearray()
-            first_fragment = True
+        for chunk in tts_resp.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            byte_buf.extend(chunk)
+            for frag in extract_wav_fragments(byte_buf):
+                if first:
+                    print(f"[tts] first audio {time.time()-t0:.2f}s")
+                    first = False
+                # send as binary frame
+                await ws.send_bytes(frag)
 
-            for chunk in tts_response.iter_content(chunk_size=4096):
-
-                if not chunk:
-                    continue
-
-                byte_buffer.extend(chunk)
-                wav_fragments = extract_wav_fragments(byte_buffer)
-
-                for fragment in wav_fragments:
-
-                    if first_fragment:
-                        latency = int((time.time() - pipeline_start) * 1000)
-                        print(f"voice→audio: {latency}ms")
-                        first_fragment = False
-
-                    yield fragment
-
-        headers = {
-            "X-User-Text": transcript,
-            "X-Assistant-Text": assistant_text,
-            "X-LLM-Latency": str(llm_latency),
-        }
-
-        return StreamingResponse(
-            generate(),
-            media_type="application/octet-stream",
-            headers=headers,
-        )
+        await ws.send_text(json.dumps({"type": "done"}))
+        return transcript, text
 
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
+
+
+# ── WebSocket endpoint ────────────────────────────────────────────────────────
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    print("[ws] connected")
+
+    vad = VadProcessor()
+    history: list = []
+    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
+
+    async def pipeline_worker():
+        while True:
+            pcm = await queue.get()
+            try:
+                transcript, response = await run_pipeline(pcm, ws, history)
+                # update text-only history
+                if transcript:
+                    history.append(HumanMessage(content=transcript))
+                history.append(AIMessage(content=response))
+                if len(history) > MAX_HISTORY:
+                    del history[:-MAX_HISTORY]
+            except Exception as e:
+                print(f"[pipeline] error: {e}")
+            finally:
+                queue.task_done()
+
+    worker = asyncio.create_task(pipeline_worker())
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if "bytes" in msg and msg["bytes"]:
+                utterance = vad.feed(msg["bytes"])
+                if utterance:
+                    try:
+                        queue.put_nowait(utterance)
+                    except asyncio.QueueFull:
+                        print("[pipeline] queue full — dropping utterance")
+            elif "text" in msg:
+                cmd = msg["text"]
+                if cmd == "__ping__":
+                    await ws.send_text("__pong__")
+    except WebSocketDisconnect:
+        print("[ws] disconnected")
+    except Exception as e:
+        print(f"[ws] error: {e}")
+    finally:
+        worker.cancel()
