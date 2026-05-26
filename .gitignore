@@ -2,8 +2,8 @@
 .langgraph_api/
 langgraph.json
 
-#not-yet folders
-hiring_analysis/
+#artifacts
+artifacts/
 
 #logs
 logs/

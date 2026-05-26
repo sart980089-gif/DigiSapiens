@@ -6,7 +6,7 @@ A small experimental repo exploring speech-based conversational agents. The proj
 
 - `gemini_live.py` – A frontend/backed demo integrating a live Gemini audio-capable LLM with `index.html`. Stateless.
 - `stt_llm_tts.py` – A classic speech-to-speech pipeline: STT → LLM → TTS. Uses `index2.html` as a simple frontend. Stateless.
-- `llm_tts.py` – Sends recorded audio directly to an LLM that accepts audio input, then passes the LLM response to TTS. Uses `index3.html`. Implements a simple text memory/history.
+- `llm_tts.py` – Sends recorded audio directly to an LLM that accepts audio input, then passes the LLM response to TTS. Uses `index3.html` or `avatar.html`. Implements a simple text memory/history.
 
 **Features & notes**
 
