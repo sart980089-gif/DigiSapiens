@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DigiSapiens</title>
+
+<style>
+
+*{
+margin:0;
+padding:0;
+box-sizing:border-box;
+}
+
+body{
+background:#0f0f11;
+color:#e8e8e8;
+font-family:monospace;
+height:100vh;
+display:flex;
+flex-direction:column;
+align-items:center;
+justify-content:center;
+gap:24px;
+overflow:hidden;
+}
+
+h1{
+color:#888;
+letter-spacing:.2em;
+font-size:1.2rem;
+}
+
+#avatar{
+position:relative;
+width:340px;
+height:340px;
+}
+
+.layer{
+position:absolute;
+inset:0;
+width:100%;
+height:100%;
+object-fit:contain;
+pointer-events:none;
+user-select:none;
+}
+
+button{
+width:180px;
+height:60px;
+border:none;
+border-radius:14px;
+background:#1b1b20;
+color:#fff;
+cursor:pointer;
+font-size:.95rem;
+transition:.2s;
+}
+
+button.active{
+background:#183220;
+box-shadow:0 0 30px rgba(80,255,120,.2);
+}
+
+#status{
+color:#777;
+}
+
+</style>
+</head>
+
+<body>
+
+<h1>DigiSapiens</h1>
+
+<div id="avatar">
+
+<img
+class="layer"
+src="./assets/base.png"
+>
+
+<img
+id="face"
+class="layer"
+src="./assets/face_idle.png"
+>
+
+</div>
+
+<button id="toggle">
+Start Conversation
+</button>
+
+<div id="status">
+idle
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/bundle.min.js"></script>
+
+<script>
+
+const WS_URL="ws://127.0.0.1:8000/ws"
+const PLAYBACK_RATE=24000
+
+const btn=document.getElementById("toggle")
+const statusEl=document.getElementById("status")
+const face=document.getElementById("face")
+
+const playbackCtx=new AudioContext({
+sampleRate:PLAYBACK_RATE
+})
+
+const analyser=playbackCtx.createAnalyser()
+
+analyser.fftSize=256
+
+const timeData=new Uint8Array(
+analyser.fftSize
+)
+
+let ws,myvad
+
+let conversationMode=false
+let assistantSpeaking=false
+let processing=false
+
+let nextPlayAt=0
+
+const faces={
+
+idle:"./assets/face_idle.png",
+blink:"./assets/face_blink.png",
+small:"./assets/face_talk_small.png",
+medium:"./assets/face_talk_medium.png"
+}
+
+function status(t){
+statusEl.innerText=t
+}
+
+function setFace(s){
+
+if(face.dataset.state===s)
+return
+
+face.dataset.state=s
+face.src=faces[s]
+}
+
+function connectWS(){
+
+ws=new WebSocket(WS_URL)
+
+ws.binaryType="arraybuffer"
+
+ws.onopen=()=>status("connected")
+
+ws.onclose=()=>{
+
+status("disconnected")
+
+setTimeout(
+connectWS,
+2000
+)
+}
+
+ws.onerror=()=>status("socket error")
+
+ws.onmessage=async(e)=>{
+
+if(typeof e.data==="string"){
+
+const m=JSON.parse(e.data)
+
+if(m.type==="assistant_start"){
+
+assistantSpeaking=true
+processing=true
+
+status("speaking...")
+}
+
+else if(
+m.type==="assistant_end"
+){
+
+assistantSpeaking=false
+processing=false
+
+if(conversationMode){
+
+myvad.start()
+
+status("listening...")
+}
+}
+
+else if(
+m.type==="interrupted"
+){
+
+assistantSpeaking=false
+processing=false
+
+nextPlayAt=0
+
+status("interrupted")
+}
+
+return
+}
+
+playPCM(e.data)
+}
+}
+
+function playPCM(buf){
+
+const int16=new Int16Array(buf)
+
+const float32=new Float32Array(
+int16.length
+)
+
+for(let i=0;i<int16.length;i++)
+float32[i]=int16[i]/32768
+
+const audioBuf=playbackCtx.createBuffer(
+1,
+float32.length,
+PLAYBACK_RATE
+)
+
+audioBuf.copyToChannel(float32,0)
+
+const src=
+playbackCtx.createBufferSource()
+
+src.buffer=audioBuf
+
+src.connect(analyser)
+
+analyser.connect(
+playbackCtx.destination
+)
+
+const start=Math.max(
+playbackCtx.currentTime+.05,
+nextPlayAt
+)
+
+src.start(start)
+
+nextPlayAt=
+start+audioBuf.duration
+}
+
+function animate(){
+
+analyser.getByteTimeDomainData(
+timeData
+)
+
+let sum=0
+
+for(let i=0;i<timeData.length;i++){
+
+const v=
+(timeData[i]-128)/128
+
+sum+=v*v
+}
+
+const rms=Math.sqrt(
+sum/timeData.length
+)
+
+const vol=rms*40
+
+if(assistantSpeaking){
+
+if(vol>5)
+setFace("medium")
+
+else if(vol>1)
+setFace("small")
+
+else
+setFace("idle")
+}
+
+else{
+
+setFace("idle")
+}
+
+requestAnimationFrame(
+animate
+)
+}
+
+function blink(){
+
+setTimeout(()=>{
+
+if(!assistantSpeaking){
+
+setFace("blink")
+
+setTimeout(()=>{
+
+setFace("idle")
+
+},120)
+}
+
+blink()
+
+},2000+Math.random()*3000)
+}
+
+function pcm16(audio){
+
+const out=new Int16Array(
+audio.length
+)
+
+for(let i=0;i<audio.length;i++){
+
+const s=Math.max(
+-1,
+Math.min(1,audio[i])
+)
+
+out[i]=
+s<0
+?s*0x8000
+:s*0x7fff
+}
+
+return out.buffer
+}
+
+async function initVAD(){
+
+ort.env.wasm.numThreads=1
+
+ort.env.wasm.wasmPaths=
+"https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/"
+
+myvad=await vad.MicVAD.new({
+
+workletURL:
+"https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/vad.worklet.bundle.min.js",
+
+modelURL:
+"https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/silero_vad.onnx",
+
+positiveSpeechThreshold:.82,
+negativeSpeechThreshold:.55,
+minSpeechFrames:6,
+redemptionFrames:14,
+
+onSpeechStart(){
+
+if(!conversationMode)
+return
+
+if(assistantSpeaking){
+
+nextPlayAt=0
+
+assistantSpeaking=false
+}
+
+status("listening...")
+},
+
+onSpeechEnd(audio){
+
+if(!conversationMode)
+return
+
+if(processing)
+return
+
+processing=true
+
+status("thinking...")
+
+myvad.pause()
+
+ws.send(
+pcm16(audio)
+)
+},
+
+onVADMisfire(){
+
+console.log(
+"vad misfire"
+)
+}
+})
+
+status("vad ready")
+}
+
+function start(){
+
+conversationMode=true
+
+btn.classList.add(
+"active"
+)
+
+btn.innerText=
+"Stop Conversation"
+
+myvad.start()
+
+status("listening...")
+}
+
+function stop(){
+
+conversationMode=false
+
+assistantSpeaking=false
+processing=false
+
+nextPlayAt=0
+
+btn.classList.remove(
+"active"
+)
+
+btn.innerText=
+"Start Conversation"
+
+myvad.pause()
+
+status("idle")
+}
+
+btn.onclick=()=>{
+
+if(conversationMode)
+stop()
+
+else
+start()
+}
+
+connectWS()
+
+animate()
+
+blink()
+
+setFace("idle")
+
+initVAD()
+
+</script>
+</body>
+</html>
