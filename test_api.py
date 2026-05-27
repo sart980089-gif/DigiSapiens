@@ -41,54 +41,64 @@ app.add_middleware(
 )
 
 @app.websocket("/ws")
-async def ws(ws:WebSocket):
+async def ws(ws: WebSocket):
 
     await ws.accept()
 
     print("[ws] connected")
 
-    active_task=None
+    # Establish the stateful session for the lifetime of this connection
+    async with client.aio.live.connect(model=MODEL, config=LIVE_CONFIG) as session:
 
-    async def stop_generation():
-
-        nonlocal active_task
-
-        if active_task and not active_task.done():
-
-            print("[gemini] cancelling old response")
-
-            active_task.cancel()
-
+        async def receive_from_gemini():
             try:
-                await asyncio.wait_for(
-                    active_task,
-                    timeout=2
-                )
-            except:
+                chunks = 0
+                while True:
+                    async for r in session.receive():
+                        c = r.server_content
+                        if not c:
+                            continue
+
+                        if c.interrupted:
+                            print("[gemini] interrupted")
+                            await ws.send_text("__interrupted__")
+                            continue
+
+                        if c.model_turn:
+                            for p in c.model_turn.parts:
+                                inline = getattr(p, "inline_data", None)
+                                if inline and inline.mime_type.startswith("audio/pcm"):
+                                    chunks += 1
+                                    await ws.send_bytes(inline.data)
+
+                        if c.turn_complete:
+                            print(f"[gemini] done chunks={chunks}")
+                            await ws.send_text("__done__")
+                            chunks = 0
+
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                print("[gemini task] ERROR:", e)
 
-        active_task=None
-
-    async def run_gemini(pcm:bytes):
+        gemini_task = asyncio.create_task(receive_from_gemini())
 
         try:
+            while True:
+                msg = await ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    print("[ws] disconnected")
+                    break
+                data = msg.get("bytes")
+                if not data:
+                    continue
 
-            dur=len(pcm)/2/16000
-
-            print(
-                f"[gemini] request "
-                f"{dur:.2f}s "
-                f"{len(pcm)} bytes"
-            )
-
-            async with client.aio.live.connect(
-                model=MODEL,
-                config=LIVE_CONFIG
-            ) as session:
+                print(f"[gemini] forwarding {len(data)} bytes of user speech")
+                await ws.send_text("__thinking__")
 
                 await session.send_realtime_input(
                     audio=types.Blob(
-                        data=pcm,
+                        data=data,
                         mime_type="audio/pcm;rate=16000"
                     )
                 )
@@ -97,100 +107,12 @@ async def ws(ws:WebSocket):
                     audio_stream_end=True
                 )
 
-                chunks=0
-
-                async for r in session.receive():
-
-                    c=r.server_content
-
-                    if not c:
-                        continue
-
-                    if c.interrupted:
-
-                        print("[gemini] interrupted")
-
-                        await ws.send_text(
-                            "__interrupted__"
-                        )
-
-                        continue
-
-                    if c.model_turn:
-
-                        for p in c.model_turn.parts:
-
-                            inline=getattr(
-                                p,
-                                "inline_data",
-                                None
-                            )
-
-                            if (
-                                inline and
-                                inline.mime_type.startswith(
-                                    "audio/pcm"
-                                )
-                            ):
-
-                                chunks+=1
-
-                                await ws.send_bytes(
-                                    inline.data
-                                )
-
-                    if c.turn_complete:
-
-                        print(
-                            f"[gemini] done "
-                            f"chunks={chunks}"
-                        )
-
-                        await ws.send_text(
-                            "__done__"
-                        )
-
-                        break
-
-        except asyncio.CancelledError:
-
-            print("[gemini] cancelled")
-
+        except WebSocketDisconnect:
+            print("[ws] disconnected")
         except Exception as e:
-
-            print("[gemini] ERROR:",e)
-
-    try:
-
-        while True:
-
-            msg=await ws.receive()
-
-            data=msg.get("bytes")
-
-            if not data:
-                continue
-
-            await stop_generation()
-
-            await ws.send_text(
-                "__thinking__"
-            )
-
-            active_task=asyncio.create_task(
-                run_gemini(data)
-            )
-
-    except WebSocketDisconnect:
-
-        print("[ws] disconnected")
-
-    except Exception as e:
-
-        print("[ws] ERROR:",e)
-
-    finally:
-
-        await stop_generation()
-
-        print("[ws] cleanup")
+            print("[ws] ERROR:", e)
+        finally:
+            # Clean up the background reader task
+            gemini_task.cancel()
+            await asyncio.gather(gemini_task, return_exceptions=True)
+            print("[ws] cleanup")

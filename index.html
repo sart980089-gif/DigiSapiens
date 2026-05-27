@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DigiSapiens-vad</title>
 
-<script src="./assets/bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 
 <link rel="icon" href="./assets/favicon.ico">
 
@@ -111,7 +112,7 @@ src="./assets/face_idle.png"
 </div>
 
 <button id="btn">
-🎤
+🔵
 </button>
 
 <div class="status" id="status">
@@ -131,6 +132,7 @@ const statusEl=document.getElementById("status")
 
 const FACES={
 idle:"./assets/face_idle.png",
+blink:"./assets/face_blink.png",
 small:"./assets/face_talk_small.png",
 medium:"./assets/face_talk_medium.png",
 large:"./assets/face_talk_large.png"
@@ -142,6 +144,17 @@ let myvad
 
 let aiSpeaking=false
 let ignoreSpeech=false
+
+let isBlinking=false
+
+function triggerBlink(){
+isBlinking=true
+setTimeout(()=>{
+isBlinking=false
+setTimeout(triggerBlink,3000+Math.random()*3000)
+},150)
+}
+setTimeout(triggerBlink,3000)
 
 let playCtx=new AudioContext({
 sampleRate:24000
@@ -375,11 +388,11 @@ onnxWASMBasePath:
 baseAssetPath:
 "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
 
-positiveSpeechThreshold:.92,
+positiveSpeechThreshold:.95,
 
-negativeSpeechThreshold:.78,
+negativeSpeechThreshold:.82,
 
-minSpeechFrames:8,
+minSpeechFrames:12,
 
 preSpeechPadFrames:6,
 
@@ -562,14 +575,13 @@ ss/td.length
 
 let f="idle"
 
-if(rms>2&&rms<6)
-f="small"
-
-else if(rms>=6&&rms<10)
-f="medium"
-
-else if(rms>=10)
-f="large"
+if(rms>2){
+if(rms<6) f="small"
+else if(rms<10) f="medium"
+else f="large"
+} else if(isBlinking) {
+f="blink"
+}
 
 if(face.src!==FACES[f])
 face.src=FACES[f]
