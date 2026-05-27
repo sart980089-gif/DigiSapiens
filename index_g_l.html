@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>DigiSapiens — Lisa</title>
+<title>DigiSapiens-1</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 
@@ -446,21 +446,21 @@ const FACES = {
   medium: "./assets/face_talk_medium.png",
   large:  "./assets/face_talk_large.png",
 };
-let curFace = "idle";
+let logicFace = "idle";
 let smoothVol = 0;
 
 function setFace(state) {
-  if (curFace === state) return;
-  curFace = state;
   faceLayer.src = FACES[state] || FACES.idle;
 }
 
 function blinkLoop() {
   const delay = 2000 + Math.random() * 4000;
   setTimeout(() => {
-    const saved = curFace;
-    setFace("blink");
-    setTimeout(() => setFace(saved), 120);
+    // Only blink if we are currently idle, to avoid interrupting speaking animations
+    if (logicFace === "idle") {
+      setFace("blink");
+      setTimeout(() => setFace(logicFace), 120);
+    }
     blinkLoop();
   }, delay);
 }
@@ -481,7 +481,12 @@ function animateMouth() {
   else if (smoothVol < 4.5) next = "small";
   else if (smoothVol < 9)   next = "medium";
   else                       next = "large";
-  setFace(next);
+
+  if (logicFace !== next) {
+    logicFace = next;
+    setFace(next);
+  }
+  
   requestAnimationFrame(animateMouth);
 }
 

@@ -1,18 +1,13 @@
 """
-llm_tts.py — LLM + TTS voice pipeline with server-side VAD over WebSocket
+llm_tts.py — LLM + TTS voice pipeline over WebSocket (No Server-side VAD)
 
 Flow:
-  Browser streams raw PCM16 @ 16 kHz chunks over WebSocket →
-  Server VAD detects speech segment                         →
-  Audio → Gemini (LLM, audio-in / text-out)                →
-  Text → TTS server                                         →
-  WAV fragments streamed back over WebSocket                →
-  Browser plays gaplessly
-
-Latency wins:
-  • No upload round-trip — LLM fires the instant VAD closes the gate
-  • TTS WAV fragments forwarded as they arrive (no re-buffering)
-  • Text-only conversation history (no audio blobs in context window)
+  Browser records PCM16 @ 16 kHz locally on Hold-to-Talk  →
+  Sends complete recorded utterance over WebSocket       →
+  Audio → Gemini (LLM, audio-in / text-out)               →
+  Text → TTS server                                        →
+  WAV fragments streamed back over WebSocket               →
+  Browser plays gaplessly and animates the Avatar
 """
 
 import asyncio
@@ -22,12 +17,9 @@ import os
 import re
 import tempfile
 import time
-from collections import deque
 
 import requests
-import webrtcvad
 import wave
-import io
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -72,16 +64,7 @@ Strict rules for the response field:
 """
 
 MAX_HISTORY = 12
-
-# ── VAD config ────────────────────────────────────────────────────────────────
-SAMPLE_RATE     = 16_000
-FRAME_MS        = 30
-FRAME_BYTES     = int(SAMPLE_RATE * FRAME_MS / 1000) * 2
-VAD_MODE        = 3
-START_FRAMES    = 4
-END_FRAMES      = 30
-PRE_ROLL_FRAMES = 8
-MIN_SPEECH_SECS = 0.4
+SAMPLE_RATE = 16_000
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="voice-pipeline-ws")
@@ -93,66 +76,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ── VAD ───────────────────────────────────────────────────────────────────────
-class VadProcessor:
-    def __init__(self):
-        self._vad         = webrtcvad.Vad(VAD_MODE)
-        self._raw_buf     = bytearray()
-        self._pre_roll    = deque(maxlen=PRE_ROLL_FRAMES)
-        self._speech_buf  = bytearray()
-        self._in_speech   = False
-        self._speech_cnt  = 0
-        self._silence_cnt = 0
-
-    def feed(self, chunk: bytes) -> bytes | None:
-        self._raw_buf.extend(chunk)
-        utterance = None
-        while len(self._raw_buf) >= FRAME_BYTES:
-            frame = bytes(self._raw_buf[:FRAME_BYTES])
-            del self._raw_buf[:FRAME_BYTES]
-            u = self._process_frame(frame)
-            if u is not None:
-                utterance = u
-        return utterance
-
-    def _process_frame(self, frame: bytes) -> bytes | None:
-        try:
-            is_speech = self._vad.is_speech(frame, SAMPLE_RATE)
-        except Exception:
-            is_speech = False
-
-        if is_speech:
-            self._speech_cnt  += 1
-            self._silence_cnt  = 0
-        else:
-            self._silence_cnt += 1
-            self._speech_cnt   = 0
-
-        if not self._in_speech:
-            self._pre_roll.append(frame)
-            if self._speech_cnt >= START_FRAMES:
-                self._in_speech = True
-                for f in self._pre_roll:
-                    self._speech_buf.extend(f)
-                self._pre_roll.clear()
-                print("[vad] START")
-        else:
-            self._speech_buf.extend(frame)
-            if self._silence_cnt >= END_FRAMES:
-                print("[vad] END")
-                utterance = bytes(self._speech_buf)
-                self._speech_buf.clear()
-                self._in_speech   = False
-                self._speech_cnt  = 0
-                self._silence_cnt = 0
-                duration = len(utterance) / 2 / SAMPLE_RATE
-                if duration < MIN_SPEECH_SECS:
-                    print(f"[vad] discard — too short ({duration:.2f}s)")
-                    return None
-                return utterance
-        return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -284,9 +207,6 @@ async def run_pipeline(pcm: bytes, ws: WebSocket, history: list) -> tuple[str, s
         byte_buf = bytearray()
         first = True
 
-        def iter_tts():
-            return tts_resp.iter_content(chunk_size=4096)
-
         for chunk in tts_resp.iter_content(chunk_size=4096):
             if not chunk:
                 continue
@@ -314,7 +234,6 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     print("[ws] connected")
 
-    vad = VadProcessor()
     history: list = []
     queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
 
@@ -340,12 +259,10 @@ async def ws_endpoint(ws: WebSocket):
         while True:
             msg = await ws.receive()
             if "bytes" in msg and msg["bytes"]:
-                utterance = vad.feed(msg["bytes"])
-                if utterance:
-                    try:
-                        queue.put_nowait(utterance)
-                    except asyncio.QueueFull:
-                        print("[pipeline] queue full — dropping utterance")
+                try:
+                    queue.put_nowait(msg["bytes"])
+                except asyncio.QueueFull:
+                    print("[pipeline] queue full — dropping utterance")
             elif "text" in msg:
                 cmd = msg["text"]
                 if cmd == "__ping__":
